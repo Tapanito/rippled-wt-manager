@@ -150,7 +150,7 @@ rw() {
             fi
             cd "$wt_path"
             if ! $no_ide; then
-                zeditor .
+                zed .
             fi
             ;;
 
@@ -258,7 +258,7 @@ rw() {
                 echo "No worktree found for branch '$branch'"
                 return 1
             }
-            cd "$wt_path" && zeditor .
+            cd "$wt_path" && zed .
             ;;
 
         claude)
