@@ -275,6 +275,22 @@ rw() {
             cd "$target_dir" && claude
             ;;
 
+        sync)
+            # Copy local configs from main repo to all existing worktrees
+            local count=0
+            while IFS= read -r line; do
+                if [[ "$line" == worktree\ * ]]; then
+                    local wt_path="${line#worktree }"
+                    if [ "$wt_path" != "$RW_MAIN_REPO" ] && [ -d "$wt_path" ]; then
+                        echo "Syncing $wt_path..."
+                        _rw_copy_local_configs "$wt_path"
+                        (( count++ ))
+                    fi
+                fi
+            done < <(git -C "$RW_MAIN_REPO" worktree list --porcelain)
+            echo "Done. Synced $count worktrees."
+            ;;
+
         sweep)
             echo "Fetching remote..."
             git -C "$RW_MAIN_REPO" fetch --prune origin 2>/dev/null
@@ -352,6 +368,7 @@ Rippled Worktree Manager (rw)
   rw list                            List all rippled worktrees
   rw rm <branch>                     Remove worktree (prompts to delete branch)
   rw claude [branch]                 Start Claude Code in worktree
+  rw sync                            Copy local configs (.envrc, .claude/, etc.) to all worktrees
   rw sweep                           Remove worktrees whose remote branch was deleted
   rw prune                           Prune stale worktree metadata
 
@@ -373,7 +390,7 @@ _rw_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "new add cd go open build list ls rm remove claude sweep prune help" -- "$cur"))
+        COMPREPLY=($(compgen -W "new add cd go open build list ls rm remove claude sync sweep prune help" -- "$cur"))
         return
     fi
 
