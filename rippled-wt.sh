@@ -77,6 +77,13 @@ _rw_copy_local_configs() {
         cp "$RW_MAIN_REPO/.pre-commit-config.yaml" "$wt_path/.pre-commit-config.yaml"
         echo "  Copied .pre-commit-config.yaml"
     fi
+
+    # .envrc (activates Nix dev shell via direnv automatically on cd)
+    if [ -f "$RW_MAIN_REPO/.envrc" ]; then
+        cp "$RW_MAIN_REPO/.envrc" "$wt_path/.envrc"
+        direnv allow "$wt_path/.envrc" 2>/dev/null
+        echo "  Copied .envrc (direnv allowed)"
+    fi
 }
 
 rw() {
@@ -86,14 +93,21 @@ rw() {
     case "$cmd" in
         new|add)
             local do_build=false
-            if [ "$1" = "--build" ]; then
-                do_build=true
+            local no_ide=false
+            local unity=false
+            while [[ "${1:-}" == --* ]]; do
+                case "$1" in
+                    --build) do_build=true ;;
+                    --no-ide) no_ide=true ;;
+                    --unity) unity=true ;;
+                    *) echo "Unknown flag: $1"; return 1 ;;
+                esac
                 shift
-            fi
+            done
             local branch="$1"
             local base="${2:-}"
             if [ -z "$branch" ]; then
-                echo "Usage: rw new [--build] <branch-name> [base-ref]"
+                echo "Usage: rw new [--build] [--no-ide] [--unity] <branch-name> [base-ref]"
                 return 1
             fi
             # If given origin/<name>, treat <name> as the local branch name and
@@ -126,12 +140,18 @@ rw() {
             echo "Copying local configs..."
             _rw_copy_local_configs "$wt_path"
             if $do_build; then
-                rw build "$branch"
+                if $unity; then
+                    rw build --unity "$branch"
+                else
+                    rw build "$branch"
+                fi
             else
                 echo "Tip: run 'rw build $branch' to set up the CMake build."
             fi
             cd "$wt_path"
-            zed .
+            if ! $no_ide; then
+                zeditor .
+            fi
             ;;
 
         cd|go)
@@ -151,10 +171,15 @@ rw() {
             ;;
 
         build)
+            local unity=false
+            if [ "$1" = "--unity" ]; then
+                unity=true
+                shift
+            fi
             local branch="$1"
             local build_type="${2:-Debug}"
             if [ -z "$branch" ]; then
-                echo "Usage: rw build <branch-name> [Debug|Release]"
+                echo "Usage: rw build [--unity] <branch-name> [Debug|Release]"
                 return 1
             fi
             local wt_path
@@ -176,6 +201,10 @@ rw() {
             # Set CCACHE_BASEDIR to the worktree root so absolute include paths are
             # normalized to relative paths — this allows ccache hits across worktrees
             # that have identical file content (common with git worktrees sharing objects).
+            local cmake_extra_args=()
+            if $unity; then
+                cmake_extra_args+=(-Dunity=ON)
+            fi
             (cd "$build_dir" && CCACHE_BASEDIR="$wt_path" cmake \
                 -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
                 -GNinja \
@@ -186,6 +215,7 @@ rw() {
                 -Duse_mold=ON \
                 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
                 -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                "${cmake_extra_args[@]}" \
                 ..) || return 1
             echo "Build configured at $build_dir"
             ln -sf .build/compile_commands.json "$wt_path/compile_commands.json"
@@ -217,6 +247,20 @@ rw() {
             fi
             ;;
 
+        open)
+            local branch="$1"
+            if [ -z "$branch" ]; then
+                echo "Usage: rw open <branch-name>"
+                return 1
+            fi
+            local wt_path
+            wt_path="$(_rw_find_wt "$branch")" || {
+                echo "No worktree found for branch '$branch'"
+                return 1
+            }
+            cd "$wt_path" && zeditor .
+            ;;
+
         claude)
             local branch="$1"
             local target_dir
@@ -231,6 +275,63 @@ rw() {
             cd "$target_dir" && claude
             ;;
 
+        sweep)
+            echo "Fetching remote..."
+            git -C "$RW_MAIN_REPO" fetch --prune origin 2>/dev/null
+
+            local stale_branches=()
+            local stale_paths=()
+            local wt_path="" branch=""
+
+            while IFS= read -r line; do
+                case "$line" in
+                    "worktree "*)
+                        wt_path="${line#worktree }"
+                        branch=""
+                        ;;
+                    "branch "*)
+                        branch="${line#branch refs/heads/}"
+                        ;;
+                    "")
+                        if [ -n "$branch" ] && [ "$wt_path" != "$RW_MAIN_REPO" ]; then
+                            local track
+                            track=$(git -C "$RW_MAIN_REPO" for-each-ref \
+                                --format='%(upstream:track)' "refs/heads/$branch")
+                            if [ "$track" = "[gone]" ]; then
+                                stale_branches+=("$branch")
+                                stale_paths+=("$wt_path")
+                            fi
+                        fi
+                        wt_path=""
+                        branch=""
+                        ;;
+                esac
+            done < <(git -C "$RW_MAIN_REPO" worktree list --porcelain; echo)
+
+            if [ ${#stale_branches[@]} -eq 0 ]; then
+                echo "No worktrees with deleted remote branches found."
+                return 0
+            fi
+
+            echo "Worktrees with deleted remote branches (likely merged):"
+            for i in "${!stale_branches[@]}"; do
+                echo "  ${stale_branches[$i]}  →  ${stale_paths[$i]}"
+            done
+            echo
+            read -rp "Remove these worktrees and branches? [y/N] " yn
+            if [[ "$yn" != [Yy]* ]]; then
+                return 0
+            fi
+            for i in "${!stale_branches[@]}"; do
+                echo "Removing ${stale_branches[$i]}..."
+                git -C "$RW_MAIN_REPO" worktree remove "${stale_paths[$i]}" 2>/dev/null || \
+                    git -C "$RW_MAIN_REPO" worktree remove --force "${stale_paths[$i]}"
+                git -C "$RW_MAIN_REPO" branch -D "${stale_branches[$i]}" 2>/dev/null
+            done
+            git -C "$RW_MAIN_REPO" worktree prune
+            echo "Done."
+            ;;
+
         prune)
             git -C "$RW_MAIN_REPO" worktree prune
             echo "Pruned stale worktree entries."
@@ -240,12 +341,18 @@ rw() {
             cat <<'EOF'
 Rippled Worktree Manager (rw)
 
-  rw new [--build] <branch> [base]   Create branch + worktree (optionally set up CMake build)
+  rw new [--build] [--no-ide] [--unity] <branch> [base]
+                                     Create branch + worktree (optionally set up CMake build)
+                                       --no-ide   Skip opening Zed editor
+                                       --unity    Pass -Dunity=ON to cmake
   rw cd [branch]                     cd into worktree (no branch = main repo)
-  rw build <branch> [Debug|Release]  Run conan install + cmake configure
+  rw open <branch>                   Open worktree in Zed editor
+  rw build [--unity] <branch> [Debug|Release]
+                                     Run conan install + cmake configure
   rw list                            List all rippled worktrees
   rw rm <branch>                     Remove worktree (prompts to delete branch)
   rw claude [branch]                 Start Claude Code in worktree
+  rw sweep                           Remove worktrees whose remote branch was deleted
   rw prune                           Prune stale worktree metadata
 
 Worktrees are created at: ~/workspace/rippled-wt/<branch-slug>
@@ -266,7 +373,7 @@ _rw_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "new add cd go build list ls rm remove claude prune help" -- "$cur"))
+        COMPREPLY=($(compgen -W "new add cd go open build list ls rm remove claude sweep prune help" -- "$cur"))
         return
     fi
 
@@ -291,7 +398,7 @@ _rw_complete() {
                 COMPREPLY=($(compgen -W "$branches" -- "$cur"))
             fi
             ;;
-        cd|go|rm|remove|claude)
+        cd|go|open|rm|remove|claude)
             [ "$COMP_CWORD" -eq 2 ] || return
             local branches
             branches=$(git -C "$RW_MAIN_REPO" worktree list --porcelain 2>/dev/null \
