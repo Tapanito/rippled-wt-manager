@@ -192,13 +192,11 @@ rw() {
             # conan must run from the worktree root with --output-folder .build
             # conanfile uses cmake_layout() + generators="build/generators", which
             # places files at <output-folder>/build/generators/ = .build/build/generators/
-            # direnv exec ensures the nix devshell is active so conan's detect_api
-            # picks up the same compiler as the devshell (avoids package ID mismatches).
             echo "==> conan install (build_type=$build_type)..."
-            direnv exec "$wt_path" conan install "$wt_path" \
-                --output-folder "$wt_path/.build" \
+            (cd "$wt_path" && conan install . \
+                --output-folder .build \
                 --build missing \
-                --settings build_type="$build_type" || return 1
+                --settings build_type="$build_type") || return 1
             echo "==> cmake configure (build_type=$build_type)..."
             # Set CCACHE_BASEDIR to the worktree root so absolute include paths are
             # normalized to relative paths — this allows ccache hits across worktrees
@@ -207,7 +205,7 @@ rw() {
             if $unity; then
                 cmake_extra_args+=(-Dunity=ON)
             fi
-            (cd "$build_dir" && CCACHE_BASEDIR="$wt_path" direnv exec "$wt_path" cmake \
+            (cd "$build_dir" && CCACHE_BASEDIR="$wt_path" cmake \
                 -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
                 -GNinja \
                 -Dxrpld=ON \
