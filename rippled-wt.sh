@@ -125,12 +125,27 @@ _rw_copy_local_configs() {
     fi
 }
 
+# For Debug builds, return NIX_HARDENING_ENABLE with fortify stripped.
+# NixOS gcc wrapper injects -D_FORTIFY_SOURCE=3 which warns at -O0.
+# For Release builds, return the original value (fortify is useful with -O2).
+_rw_hardening_env() {
+    local build_type="$1"
+    if [ "$build_type" = "Debug" ]; then
+        local nih="${NIX_HARDENING_ENABLE:-}"
+        nih="${nih//fortify3/}"
+        nih="${nih//fortify/}"
+        echo "$nih"
+    else
+        echo "${NIX_HARDENING_ENABLE:-}"
+    fi
+}
+
 # Run conan install for a worktree
 _rw_do_conan() {
     local wt_path="$1"
     local build_type="$2"
     echo "==> conan install (build_type=$build_type)..."
-    (cd "$wt_path" && conan install . \
+    (cd "$wt_path" && NIX_HARDENING_ENABLE="$(_rw_hardening_env "$build_type")" conan install . \
         --output-folder .build \
         --build missing \
         --settings build_type="$build_type") || return 1
@@ -162,7 +177,7 @@ _rw_do_configure() {
     fi
 
     echo "==> cmake configure (build_type=$build_type)..."
-    (cd "$build_dir" && cmake "${cmake_args[@]}" ..) || return 1
+    (cd "$build_dir" && NIX_HARDENING_ENABLE="$(_rw_hardening_env "$build_type")" cmake "${cmake_args[@]}" ..) || return 1
 
     ln -sf .build/compile_commands.json "$wt_path/compile_commands.json"
     echo "Symlinked compile_commands.json -> .build/compile_commands.json"
@@ -172,8 +187,9 @@ _rw_do_configure() {
 _rw_do_build() {
     local wt_path="$1"
     local jobs="$2"
+    local build_type="$3"
     echo "==> cmake build (-j $jobs)..."
-    cmake --build "$wt_path/.build" -j "$jobs" || return 1
+    NIX_HARDENING_ENABLE="$(_rw_hardening_env "$build_type")" cmake --build "$wt_path/.build" -j "$jobs" || return 1
 }
 
 rw() {
@@ -301,7 +317,7 @@ rw() {
             fi
 
             # Build
-            _rw_do_build "$wt_path" "$_rw_jobs" || return 1
+            _rw_do_build "$wt_path" "$_rw_jobs" "$_rw_mode" || return 1
             echo "Build complete."
             ;;
 
