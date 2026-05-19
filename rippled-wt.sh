@@ -36,6 +36,45 @@ _rw_find_wt() {
     return 1
 }
 
+# Resolve worktree path from branch name or current directory
+_rw_resolve_wt() {
+    local branch="$1"
+    if [ -n "$branch" ]; then
+        _rw_find_wt "$branch"
+        return $?
+    fi
+    # Detect from current directory
+    local git_root
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "Not in a git worktree and no branch specified." >&2
+        return 1
+    }
+    echo "$git_root"
+}
+
+# Parse common flags: --mode=<type>, --unity, -j <N>
+# Sets: _rw_mode, _rw_unity, _rw_jobs, _rw_clean, _rw_branch
+_rw_parse_flags() {
+    _rw_mode="Debug"
+    _rw_unity=false
+    _rw_jobs=$(nproc 2>/dev/null || echo 12)
+    _rw_clean=false
+    _rw_branch=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode=*) _rw_mode="${1#--mode=}" ;;
+            --unity)  _rw_unity=true ;;
+            --clean)  _rw_clean=true ;;
+            -j)       shift; _rw_jobs="$1" ;;
+            -j*)      _rw_jobs="${1#-j}" ;;
+            -*)       echo "Unknown flag: $1" >&2; return 1 ;;
+            *)        _rw_branch="$1" ;;
+        esac
+        shift
+    done
+}
+
 # Encode a path into Claude's project directory name (/ → -)
 _rw_claude_project_dir() {
     echo "${HOME}/.claude/projects/$(echo "$1" | tr '/' '-')"
@@ -84,6 +123,57 @@ _rw_copy_local_configs() {
         direnv allow "$wt_path/.envrc" 2>/dev/null
         echo "  Copied .envrc (direnv allowed)"
     fi
+}
+
+# Run conan install for a worktree
+_rw_do_conan() {
+    local wt_path="$1"
+    local build_type="$2"
+    echo "==> conan install (build_type=$build_type)..."
+    (cd "$wt_path" && conan install . \
+        --output-folder .build \
+        --build missing \
+        --settings build_type="$build_type") || return 1
+}
+
+# Run cmake configure for a worktree
+_rw_do_configure() {
+    local wt_path="$1"
+    local build_type="$2"
+    local unity="$3"
+    local build_dir="$wt_path/.build"
+    mkdir -p "$build_dir"
+
+    local cmake_args=(
+        -G Ninja
+        -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake
+        -DCMAKE_BUILD_TYPE="$build_type"
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold"
+        -DCMAKE_C_FLAGS="-gsplit-dwarf"
+        -DCMAKE_CXX_FLAGS="-gsplit-dwarf"
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+        -Dxrpld=ON
+        -Dtests=ON
+    )
+    if [ "$unity" = true ]; then
+        cmake_args+=(-Dunity=ON)
+    fi
+
+    echo "==> cmake configure (build_type=$build_type)..."
+    (cd "$build_dir" && cmake "${cmake_args[@]}" ..) || return 1
+
+    ln -sf .build/compile_commands.json "$wt_path/compile_commands.json"
+    echo "Symlinked compile_commands.json -> .build/compile_commands.json"
+}
+
+# Run cmake build for a worktree
+_rw_do_build() {
+    local wt_path="$1"
+    local jobs="$2"
+    echo "==> cmake build (-j $jobs)..."
+    cmake --build "$wt_path/.build" -j "$jobs" || return 1
 }
 
 rw() {
@@ -140,13 +230,11 @@ rw() {
             echo "Copying local configs..."
             _rw_copy_local_configs "$wt_path"
             if $do_build; then
-                if $unity; then
-                    rw build --unity "$branch"
-                else
-                    rw build "$branch"
-                fi
+                local build_args=()
+                $unity && build_args+=(--unity)
+                rw configure "${build_args[@]}" "$branch"
             else
-                echo "Tip: run 'rw build $branch' to set up the CMake build."
+                echo "Tip: run 'rw make $branch' to build."
             fi
             cd "$wt_path"
             if ! $no_ide; then
@@ -154,72 +242,119 @@ rw() {
             fi
             ;;
 
-        cd|go)
-            local branch="$1"
-            if [ -z "$branch" ]; then
-                cd "$RW_MAIN_REPO"
-                return 0
-            fi
+        clean)
+            _rw_parse_flags "$@" || return 1
             local wt_path
-            wt_path="$(_rw_find_wt "$branch")" || {
-                echo "No worktree found for branch '$branch'"
-                echo "Known worktrees:"
-                git -C "$RW_MAIN_REPO" worktree list
-                return 1
-            }
-            cd "$wt_path"
+            wt_path="$(_rw_resolve_wt "$_rw_branch")" || return 1
+            local build_dir="$wt_path/.build"
+            if [ -d "$build_dir" ]; then
+                echo "Removing $build_dir..."
+                rm -rf "$build_dir"
+                rm -f "$wt_path/compile_commands.json"
+                echo "Clean."
+            else
+                echo "Nothing to clean (no .build/ directory)."
+            fi
             ;;
 
-        build)
-            local unity=false
-            if [ "$1" = "--unity" ]; then
-                unity=true
-                shift
+        conan)
+            _rw_parse_flags "$@" || return 1
+            local wt_path
+            wt_path="$(_rw_resolve_wt "$_rw_branch")" || return 1
+            _rw_do_conan "$wt_path" "$_rw_mode" || return 1
+            echo "Conan install done."
+            ;;
+
+        configure|build)
+            _rw_parse_flags "$@" || return 1
+            local wt_path
+            wt_path="$(_rw_resolve_wt "$_rw_branch")" || return 1
+            local toolchain="$wt_path/.build/build/generators/conan_toolchain.cmake"
+            if [ ! -f "$toolchain" ]; then
+                echo "Conan toolchain not found, running conan install first..."
+                _rw_do_conan "$wt_path" "$_rw_mode" || return 1
             fi
-            local branch="$1"
-            local build_type="${2:-Debug}"
-            if [ -z "$branch" ]; then
-                echo "Usage: rw build [--unity] <branch-name> [Debug|Release]"
+            _rw_do_configure "$wt_path" "$_rw_mode" "$_rw_unity" || return 1
+            echo "Configure done at $wt_path/.build"
+            ;;
+
+        make)
+            _rw_parse_flags "$@" || return 1
+            local wt_path
+            wt_path="$(_rw_resolve_wt "$_rw_branch")" || return 1
+
+            if $_rw_clean; then
+                rm -rf "$wt_path/.build"
+                rm -f "$wt_path/compile_commands.json"
+                echo "Cleaned .build/"
+            fi
+
+            # Conan: run if toolchain is missing
+            local toolchain="$wt_path/.build/build/generators/conan_toolchain.cmake"
+            if [ ! -f "$toolchain" ]; then
+                _rw_do_conan "$wt_path" "$_rw_mode" || return 1
+            fi
+
+            # Configure: run if build.ninja is missing
+            if [ ! -f "$wt_path/.build/build.ninja" ]; then
+                _rw_do_configure "$wt_path" "$_rw_mode" "$_rw_unity" || return 1
+            fi
+
+            # Build
+            _rw_do_build "$wt_path" "$_rw_jobs" || return 1
+            echo "Build complete."
+            ;;
+
+        tidy)
+            _rw_parse_flags "$@" || return 1
+            local wt_path
+            wt_path="$(_rw_resolve_wt "$_rw_branch")" || return 1
+            local build_dir="$wt_path/.build"
+
+            if [ ! -f "$build_dir/compile_commands.json" ]; then
+                echo "No compile_commands.json found. Run 'rw make' first."
                 return 1
             fi
-            local wt_path
-            wt_path="$(_rw_find_wt "$branch")" || {
-                echo "No worktree found for branch '$branch'"
+
+            local run_ct
+            run_ct=$(command -v run-clang-tidy 2>/dev/null) || {
+                echo "run-clang-tidy not found in PATH."
                 return 1
             }
-            local build_dir="$wt_path/.build"
-            mkdir -p "$build_dir"
-            # conan must run from the worktree root with --output-folder .build
-            # conanfile uses cmake_layout() + generators="build/generators", which
-            # places files at <output-folder>/build/generators/ = .build/build/generators/
-            echo "==> conan install (build_type=$build_type)..."
-            (cd "$wt_path" && conan install . \
-                --output-folder .build \
-                --build missing \
-                --settings build_type="$build_type") || return 1
-            echo "==> cmake configure (build_type=$build_type)..."
-            # Set CCACHE_BASEDIR to the worktree root so absolute include paths are
-            # normalized to relative paths — this allows ccache hits across worktrees
-            # that have identical file content (common with git worktrees sharing objects).
-            local cmake_extra_args=()
-            if $unity; then
-                cmake_extra_args+=(-Dunity=ON)
+
+            # Find merge-base with develop (or origin/develop)
+            local base_ref
+            base_ref=$(git -C "$wt_path" merge-base HEAD origin/develop 2>/dev/null \
+                    || git -C "$wt_path" merge-base HEAD develop 2>/dev/null) || {
+                echo "Could not determine merge-base with develop."
+                return 1
+            }
+
+            # Get changed C/C++ files
+            local -a changed_files=()
+            while IFS= read -r f; do
+                case "$f" in
+                    *.cpp|*.h|*.hpp|*.ipp) changed_files+=("$wt_path/$f") ;;
+                esac
+            done < <(git -C "$wt_path" diff --name-only --diff-filter=d "$base_ref"...HEAD)
+
+            if [ ${#changed_files[@]} -eq 0 ]; then
+                echo "No C/C++ files changed vs develop."
+                return 0
             fi
-            (cd "$build_dir" && CCACHE_BASEDIR="$wt_path" cmake \
-                -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake \
-                -GNinja \
-                -Dxrpld=ON \
-                -Dtests=ON \
-                -DCMAKE_BUILD_TYPE="$build_type" \
-                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-                -Duse_mold=ON \
-                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-                "${cmake_extra_args[@]}" \
-                ..) || return 1
-            echo "Build configured at $build_dir"
-            ln -sf .build/compile_commands.json "$wt_path/compile_commands.json"
-            echo "Symlinked compile_commands.json -> .build/compile_commands.json"
+
+            echo "Running clang-tidy on ${#changed_files[@]} file(s)..."
+            local output_file="$wt_path/.build/clang-tidy-output.txt"
+
+            "$run_ct" \
+                -j "$_rw_jobs" \
+                -p "$build_dir" \
+                -quiet \
+                -fix \
+                -allow-no-checks \
+                "${changed_files[@]}" 2>&1 | tee "$output_file"
+
+            echo "Output saved to $output_file"
             ;;
 
         list|ls)
@@ -358,13 +493,28 @@ rw() {
 Rippled Worktree Manager (rw)
 
   rw new [--build] [--no-ide] [--unity] <branch> [base]
-                                     Create branch + worktree (optionally set up CMake build)
-                                       --no-ide   Skip opening Zed editor
-                                       --unity    Pass -Dunity=ON to cmake
+                                     Create branch + worktree
   rw cd [branch]                     cd into worktree (no branch = main repo)
   rw open <branch>                   Open worktree in Zed editor
-  rw build [--unity] <branch> [Debug|Release]
-                                     Run conan install + cmake configure
+
+Build commands (branch is optional — defaults to current directory):
+
+  rw clean [branch]                  Remove .build/ directory
+  rw conan [branch] [--mode=Debug|Release]
+                                     Run conan install only
+  rw configure [branch] [--mode=Debug|Release] [--unity]
+                                     Run cmake configure only (auto-runs conan if needed)
+  rw make [branch] [--mode=Debug|Release] [--unity] [--clean] [-j N]
+                                     Smart build: conan if needed → configure if needed → compile
+                                       --clean    Clean .build/ first
+                                       --mode=X   Build type (default: Debug)
+                                       -j N       Parallel jobs (default: nproc)
+
+  rw tidy [branch] [-j N]            Run clang-tidy on files changed vs develop
+  rw build                           Alias for 'rw configure' (backward compat)
+
+Worktree management:
+
   rw list                            List all rippled worktrees
   rw rm <branch>                     Remove worktree (prompts to delete branch)
   rw claude [branch]                 Start Claude Code in worktree
@@ -373,13 +523,6 @@ Rippled Worktree Manager (rw)
   rw prune                           Prune stale worktree metadata
 
 Worktrees are created at: ~/workspace/rippled-wt/<branch-slug>
-
-Local configs copied from main repo on `rw new`:
-  .claude/                   Claude Code settings and skills
-  .claude/settings.local.json  (paths rewritten for worktree)
-  Claude project memory      (symlinked to main repo's memory)
-  .gitignore_local           Local gitignore (core.excludesFile)
-  .pre-commit-config.yaml    Pre-commit hooks (incl. clang-tidy)
 EOF
             ;;
     esac
@@ -390,7 +533,7 @@ _rw_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]}"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "new add cd go open build list ls rm remove claude sync sweep prune help" -- "$cur"))
+        COMPREPLY=($(compgen -W "new add cd go open clean conan configure build make tidy list ls rm remove claude sync sweep prune help" -- "$cur"))
         return
     fi
 
@@ -422,16 +565,18 @@ _rw_complete() {
                 | awk '/^branch / { sub("branch refs/heads/",""); print }')
             COMPREPLY=($(compgen -W "$branches" -- "$cur"))
             ;;
-        build)
-            case "$COMP_CWORD" in
-                2)
-                    local branches
-                    branches=$(git -C "$RW_MAIN_REPO" worktree list --porcelain 2>/dev/null \
-                        | awk '/^branch / { sub("branch refs/heads/",""); print }')
-                    COMPREPLY=($(compgen -W "$branches" -- "$cur"))
-                    ;;
-                3) COMPREPLY=($(compgen -W "Debug Release" -- "$cur")) ;;
-            esac
+        clean|conan|configure|build|make|tidy)
+            if [[ "$cur" == --* ]]; then
+                local flags="--mode=Debug --mode=Release --unity --clean"
+                COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+            elif [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "-j --mode=Debug --mode=Release --unity --clean" -- "$cur"))
+            else
+                local branches
+                branches=$(git -C "$RW_MAIN_REPO" worktree list --porcelain 2>/dev/null \
+                    | awk '/^branch / { sub("branch refs/heads/",""); print }')
+                COMPREPLY=($(compgen -W "$branches" -- "$cur"))
+            fi
             ;;
     esac
 }
