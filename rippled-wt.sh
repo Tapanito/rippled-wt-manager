@@ -164,8 +164,8 @@ _rw_do_configure() {
         -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake
         -DCMAKE_BUILD_TYPE="$build_type"
         -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold"
-        -DCMAKE_C_FLAGS="-gsplit-dwarf"
-        -DCMAKE_CXX_FLAGS="-gsplit-dwarf"
+        -DCMAKE_C_FLAGS="-gsplit-dwarf -fdebug-prefix-map=$wt_path=."
+        -DCMAKE_CXX_FLAGS="-gsplit-dwarf -fdebug-prefix-map=$wt_path=."
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
         -DCMAKE_C_COMPILER_LAUNCHER=ccache
         -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
