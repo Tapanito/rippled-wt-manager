@@ -86,7 +86,8 @@ _rw_copy_local_configs() {
 
     # .claude/ directory (settings, skills)
     if [ -d "$RW_MAIN_REPO/.claude" ]; then
-        cp -r "$RW_MAIN_REPO/.claude" "$wt_path/.claude"
+        mkdir -p "$wt_path/.claude"
+        cp -r "$RW_MAIN_REPO/.claude/." "$wt_path/.claude/"
         echo "  Copied .claude/"
     fi
 
@@ -256,6 +257,20 @@ rw() {
             if ! $no_ide; then
                 zed .
             fi
+            ;;
+
+        cd|go)
+            local branch="$1"
+            local target_dir
+            if [ -z "$branch" ]; then
+                target_dir="$RW_MAIN_REPO"
+            else
+                target_dir="$(_rw_find_wt "$branch")" || {
+                    echo "No worktree found for branch '$branch'"
+                    return 1
+                }
+            fi
+            cd "$target_dir"
             ;;
 
         clean)
