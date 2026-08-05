@@ -2,7 +2,7 @@
 name: rw
 description: Use the `rw` worktree manager to build, clean, configure, or manage rippled worktrees. Use when the user wants to build rippled, create a worktree, clean the build, run conan, or configure cmake.
 argument-hint: "[command] [branch] [flags]"
-allowed-tools: Bash(rw *), Bash(source *), Read
+allowed-tools: Bash(rw *), Read
 ---
 
 # Rippled Worktree Manager (rw)
@@ -125,6 +125,6 @@ The cmake configure step uses these flags (NixOS-specific):
 
 ## Important Notes
 
-- `rw` is a shell function, not a binary — it must be sourced to work (it uses `cd`)
+- `rw` is available as a wrapper executable at `~/.local/bin/rw` for non-interactive shells (e.g. Claude Code agents). Interactive shells source the function from `~/.bashrc` which also enables `rw cd`/`rw new`/`rw claude` to `cd` the calling shell.
 - Build commands work from any directory inside a worktree when no branch is specified
 - The `--mode` flag defaults to Debug if omitted

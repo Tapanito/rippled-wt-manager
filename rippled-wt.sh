@@ -97,6 +97,19 @@ _rw_copy_local_configs() {
         echo "  Fixed .claude/settings.local.json paths"
     fi
 
+    # Generate .mcp.json with the correct MCP paths for this worktree.
+    if command -v codedb-init-worktree > /dev/null 2>&1; then
+        codedb-init-worktree "$wt_path"
+    fi
+    if command -v codegraph-init-worktree > /dev/null 2>&1; then
+        codegraph-init-worktree "$wt_path"
+    fi
+    # Fallback: copy from main repo with path substitution if still missing
+    if [ ! -f "$wt_path/.mcp.json" ] && [ -f "$RW_MAIN_REPO/.mcp.json" ]; then
+        sed "s|${RW_MAIN_REPO}|${wt_path}|g" "$RW_MAIN_REPO/.mcp.json" > "$wt_path/.mcp.json"
+        echo "  Copied .mcp.json"
+    fi
+
     # Symlink Claude project memory so all worktrees share the same memory
     local main_proj_dir="$(_rw_claude_project_dir "$RW_MAIN_REPO")"
     local wt_proj_dir="$(_rw_claude_project_dir "$wt_path")"
