@@ -154,8 +154,64 @@ _rw_hardening_env() {
     fi
 }
 
-# Run conan install for a worktree
+# ---------------------------------------------------------------------------
+# Build mutex
+#
+# Several agents may work in different worktrees on this one machine, and two
+# simultaneous builds exhaust RAM and take the box down. Every heavy operation
+# — dependency compiles, the build itself, clang-tidy — runs under one flock.
+#
+# The lock file is shared with rw-lock.sh (same default path), so wrapping a
+# test run in `rw-lock.sh -- ./xrpld -u ...` correctly excludes a concurrent
+# `rw make`. RW_LOCK_HELD is the re-entrancy flag both honour: when it is set,
+# an outer holder already has the lock and we must not try to take it again.
+#
+# Correctness comes from flock(2) on a descriptor: the kernel drops it once
+# every process holding it exits, so there is nothing to clean up after a
+# crash. Note that killing a holder does NOT release the lock while the build
+# it started is still running — that is deliberate, the machine is still busy.
+# To break a lock by hand, kill the process group shown by `rw-lock.sh --status`.
+# ---------------------------------------------------------------------------
+RW_LOCK_FILE="${RW_LOCK_FILE:-$HOME/.cache/rippled-build.lock}"
+
+_rw_locked() {
+    local label="$1"; shift
+
+    if [ "${RW_LOCK_HELD:-}" = "1" ]; then
+        "$@"
+        return $?
+    fi
+
+    mkdir -p -- "$(dirname -- "$RW_LOCK_FILE")" 2>/dev/null
+    local info="$RW_LOCK_FILE.info"
+
+    (
+        if ! flock -n 9; then
+            echo "==> build lock held by another agent, waiting..." >&2
+            [ -s "$info" ] && sed 's/^/    /' "$info" >&2
+            flock 9 || { echo "==> could not acquire build lock" >&2; exit 70; }
+        fi
+        {
+            printf 'label   : %s\n' "$label"
+            printf 'pid     : %s\n' "$BASHPID"
+            printf 'pgid    : %s\n' "$(ps -o pgid= -p "$BASHPID" 2>/dev/null | tr -d ' ')"
+            printf 'started : %s\n' "$(date -Is)"
+            printf 'worktree: %s\n' "$PWD"
+            printf 'command : %s\n' "$*"
+        } >"$info" 2>/dev/null
+        RW_LOCK_HELD=1 "$@"
+        local rc=$?
+        : >"$info" 2>/dev/null
+        exit $rc
+    ) 9>>"$RW_LOCK_FILE"
+}
+
+# Run conan install for a worktree (dependency compiles are heavy: locked)
 _rw_do_conan() {
+    _rw_locked "conan: $(basename -- "$1")" _rw_do_conan_unlocked "$@"
+}
+
+_rw_do_conan_unlocked() {
     local wt_path="$1"
     local build_type="$2"
     echo "==> conan install (build_type=$build_type)..."
@@ -197,8 +253,12 @@ _rw_do_configure() {
     echo "Symlinked compile_commands.json -> .build/compile_commands.json"
 }
 
-# Run cmake build for a worktree
+# Run cmake build for a worktree (the heavy one: locked)
 _rw_do_build() {
+    _rw_locked "build: $(basename -- "$1") -j$2" _rw_do_build_unlocked "$@"
+}
+
+_rw_do_build_unlocked() {
     local wt_path="$1"
     local jobs="$2"
     local build_type="$3"
@@ -390,7 +450,9 @@ rw() {
             echo "Running clang-tidy on ${#changed_files[@]} file(s)..."
             local output_file="$wt_path/.build/clang-tidy-output.txt"
 
-            "$run_ct" \
+            # clang-tidy at -j nproc is as heavy as a build: same lock.
+            _rw_locked "tidy: $(basename -- "$wt_path") -j$_rw_jobs" \
+                "$run_ct" \
                 -j "$_rw_jobs" \
                 -p "$build_dir" \
                 -quiet \
@@ -556,6 +618,17 @@ Build commands (branch is optional — defaults to current directory):
 
   rw tidy [branch] [-j N]            Run clang-tidy on files changed vs develop
   rw build                           Alias for 'rw configure' (backward compat)
+
+Build mutex (for concurrent agents sharing this machine):
+
+  conan, make and tidy automatically serialise against each other across all
+  worktrees, so two agents can never build at once. Nothing to remember.
+
+  Test runs are NOT covered, because they do not go through rw. Wrap them:
+      rw-lock.sh --label "tests" -- bash -c 'cd .build && ./xrpld -u <Suites>'
+
+  rw-lock.sh --status               Show whether a build/test is running, and whose
+  RW_LOCK_FILE=<path>               Override the lock file (default ~/.cache/rippled-build.lock)
 
 Worktree management:
 
