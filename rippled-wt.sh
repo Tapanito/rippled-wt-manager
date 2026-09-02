@@ -447,6 +447,30 @@ rw() {
                 return 0
             fi
 
+            # Unity builds fold multiple .cpp files into synthetic Unity/unity_N_cxx.cxx
+            # translation units, so compile_commands.json has no entry for the real
+            # source paths. run-clang-tidy then silently drops any changed file it
+            # can't match -- no error, no warning -- while CI (which never builds with
+            # unity) analyses it for real. Warn loudly and check for that here instead
+            # of finding out from a CI failure.
+            if grep -q '^CMAKE_UNITY_BUILD:BOOL=ON$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
+                echo "WARNING: this build was configured with --unity." >&2
+                echo "         clang-tidy cannot match changed files against unity-batched" >&2
+                echo "         compile_commands.json entries and will silently skip them." >&2
+                echo "         Reconfigure without --unity (rw configure) for reliable tidy results." >&2
+            fi
+
+            local -a missing_files=()
+            for f in "${changed_files[@]}"; do
+                grep -qF "\"$f\"" "$build_dir/compile_commands.json" || missing_files+=("$f")
+            done
+            if [ ${#missing_files[@]} -gt 0 ]; then
+                echo "WARNING: ${#missing_files[@]} changed file(s) have no entry in" \
+                    "compile_commands.json and will be SILENTLY skipped by clang-tidy:" >&2
+                printf '         %s\n' "${missing_files[@]}" >&2
+                echo "         Run 'rw make' to refresh the compilation database first." >&2
+            fi
+
             echo "Running clang-tidy on ${#changed_files[@]} file(s)..."
             local output_file="$wt_path/.build/clang-tidy-output.txt"
 
@@ -533,11 +557,27 @@ rw() {
             ;;
 
         sweep)
+            local do_builds=false
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --builds) do_builds=true ;;
+                    *) echo "Unknown flag: $1"; return 1 ;;
+                esac
+                shift
+            done
+
             echo "Fetching remote..."
             git -C "$RW_MAIN_REPO" fetch --prune origin 2>/dev/null
 
+            local merged_branches
+            merged_branches=$(git -C "$RW_MAIN_REPO" branch --merged origin/develop \
+                --format='%(refname:short)' 2>/dev/null)
+
             local stale_branches=()
             local stale_paths=()
+            local stale_reasons=()
+            local stale_dirty=()
+            local stale_unpushed=()
             local wt_path="" branch=""
 
             while IFS= read -r line; do
@@ -551,12 +591,35 @@ rw() {
                         ;;
                     "")
                         if [ -n "$branch" ] && [ "$wt_path" != "$RW_MAIN_REPO" ]; then
-                            local track
+                            local track reason=""
                             track=$(git -C "$RW_MAIN_REPO" for-each-ref \
                                 --format='%(upstream:track)' "refs/heads/$branch")
                             if [ "$track" = "[gone]" ]; then
+                                reason="remote deleted"
+                            elif grep -qxF "$branch" <<< "$merged_branches"; then
+                                # `branch --merged` also matches a branch that never
+                                # diverged from develop (e.g. just created, no commits
+                                # yet) -- only treat it as merged if it actually has
+                                # commits beyond the merge-base.
+                                local mb tip
+                                mb=$(git -C "$RW_MAIN_REPO" merge-base "$branch" origin/develop 2>/dev/null)
+                                tip=$(git -C "$RW_MAIN_REPO" rev-parse "$branch" 2>/dev/null)
+                                if [ -n "$mb" ] && [ "$mb" != "$tip" ]; then
+                                    reason="merged into develop"
+                                fi
+                            fi
+                            if [ -n "$reason" ]; then
+                                local dirty="" unpushed=0
+                                if [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]; then
+                                    dirty="yes"
+                                fi
+                                unpushed=$(git -C "$RW_MAIN_REPO" rev-list --count \
+                                    origin/develop.."$branch" 2>/dev/null)
                                 stale_branches+=("$branch")
                                 stale_paths+=("$wt_path")
+                                stale_reasons+=("$reason")
+                                stale_dirty+=("$dirty")
+                                stale_unpushed+=("${unpushed:-0}")
                             fi
                         fi
                         wt_path=""
@@ -566,26 +629,72 @@ rw() {
             done < <(git -C "$RW_MAIN_REPO" worktree list --porcelain; echo)
 
             if [ ${#stale_branches[@]} -eq 0 ]; then
-                echo "No worktrees with deleted remote branches found."
-                return 0
+                echo "No merged or remote-deleted branches found."
+            else
+                echo "Worktrees with merged or remote-deleted branches:"
+                for i in "${!stale_branches[@]}"; do
+                    local flags=""
+                    [ -n "${stale_dirty[$i]}" ] && flags+=" [uncommitted changes]"
+                    [ "${stale_unpushed[$i]}" != "0" ] && flags+=" [${stale_unpushed[$i]} unpushed commit(s)]"
+                    echo "  ${stale_branches[$i]}  →  ${stale_paths[$i]}  (${stale_reasons[$i]})${flags}"
+                done
+                echo
+                read -rp "Remove these worktrees and branches? [y/N] " yn
+                if [[ "$yn" == [Yy]* ]]; then
+                    for i in "${!stale_branches[@]}"; do
+                        if [ -n "${stale_dirty[$i]}" ] || [ "${stale_unpushed[$i]}" != "0" ]; then
+                            echo
+                            echo "Branch '${stale_branches[$i]}' has:"
+                            [ -n "${stale_dirty[$i]}" ] && echo "  - uncommitted/untracked changes in $wt_path"
+                            [ "${stale_unpushed[$i]}" != "0" ] && \
+                                echo "  - ${stale_unpushed[$i]} commit(s) not on origin/develop"
+                            read -rp "  Remove '${stale_branches[$i]}' anyway? [y/N] " yn2
+                            if [[ "$yn2" != [Yy]* ]]; then
+                                echo "  Skipped."
+                                continue
+                            fi
+                        fi
+                        echo "Removing ${stale_branches[$i]}..."
+                        git -C "$RW_MAIN_REPO" worktree remove "${stale_paths[$i]}" 2>/dev/null || {
+                            echo "  Skipping: worktree has changes git refuses to discard (use 'git worktree remove --force' manually if you're sure)." >&2
+                            continue
+                        }
+                        git -C "$RW_MAIN_REPO" branch -D "${stale_branches[$i]}" 2>/dev/null
+                    done
+                    git -C "$RW_MAIN_REPO" worktree prune
+                fi
             fi
 
-            echo "Worktrees with deleted remote branches (likely merged):"
-            for i in "${!stale_branches[@]}"; do
-                echo "  ${stale_branches[$i]}  →  ${stale_paths[$i]}"
-            done
-            echo
-            read -rp "Remove these worktrees and branches? [y/N] " yn
-            if [[ "$yn" != [Yy]* ]]; then
-                return 0
+            if $do_builds; then
+                echo
+                echo "Scanning for stale .build/ directories (no file touched in 7 days)..."
+                local stale_build_dirs=()
+                while IFS= read -r line; do
+                    [[ "$line" == worktree\ * ]] || continue
+                    local wp="${line#worktree }"
+                    local bd="$wp/.build"
+                    [ -d "$bd" ] || continue
+                    if [ -z "$(find "$bd" -mtime -7 -print -quit 2>/dev/null)" ]; then
+                        stale_build_dirs+=("$bd")
+                    fi
+                done < <(git -C "$RW_MAIN_REPO" worktree list --porcelain)
+
+                if [ ${#stale_build_dirs[@]} -eq 0 ]; then
+                    echo "No stale .build/ directories found."
+                else
+                    echo "Stale .build/ directories (untouched for 7+ days):"
+                    printf '  %s\n' "${stale_build_dirs[@]}"
+                    echo
+                    read -rp "Delete these .build/ directories? [y/N] " yn
+                    if [[ "$yn" == [Yy]* ]]; then
+                        for bd in "${stale_build_dirs[@]}"; do
+                            echo "Removing $bd..."
+                            rm -rf "$bd"
+                            rm -f "$(dirname "$bd")/compile_commands.json"
+                        done
+                    fi
+                fi
             fi
-            for i in "${!stale_branches[@]}"; do
-                echo "Removing ${stale_branches[$i]}..."
-                git -C "$RW_MAIN_REPO" worktree remove "${stale_paths[$i]}" 2>/dev/null || \
-                    git -C "$RW_MAIN_REPO" worktree remove --force "${stale_paths[$i]}"
-                git -C "$RW_MAIN_REPO" branch -D "${stale_branches[$i]}" 2>/dev/null
-            done
-            git -C "$RW_MAIN_REPO" worktree prune
             echo "Done."
             ;;
 
@@ -636,7 +745,9 @@ Worktree management:
   rw rm <branch>                     Remove worktree (prompts to delete branch)
   rw claude [branch]                 Start Claude Code in worktree
   rw sync                            Copy local configs (.envrc, .claude/, etc.) to all worktrees
-  rw sweep                           Remove worktrees whose remote branch was deleted
+  rw sweep [--builds]                Remove worktrees whose branch is merged into develop
+                                       or whose remote branch was deleted
+                                       --builds   Also delete .build/ dirs untouched 7+ days
   rw prune                           Prune stale worktree metadata
 
 Worktrees are created at: ~/workspace/rippled-wt/<branch-slug>
@@ -694,6 +805,9 @@ _rw_complete() {
                     | awk '/^branch / { sub("branch refs/heads/",""); print }')
                 COMPREPLY=($(compgen -W "$branches" -- "$cur"))
             fi
+            ;;
+        sweep)
+            COMPREPLY=($(compgen -W "--builds" -- "$cur"))
             ;;
     esac
 }
