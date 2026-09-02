@@ -81,7 +81,7 @@ rw tidy                              # clang-tidy changed files
 | `rw rm <branch>` | Remove worktree (prompts to delete branch) |
 | `rw list` | List all worktrees |
 | `rw sync` | Copy local configs to all existing worktrees |
-| `rw sweep` | Remove worktrees whose remote branch was deleted |
+| `rw sweep [--builds]` | Remove worktrees merged into develop or whose remote branch was deleted; `--builds` also offers to delete `.build/` dirs untouched 7+ days |
 | `rw prune` | Prune stale worktree metadata |
 
 **`rw new` examples:**
@@ -91,6 +91,20 @@ rw new tapanito/fix-something develop        # branch from develop
 rw new origin/someone/feature                # track existing remote branch
 rw new --build --no-ide tapanito/feature     # create + build, skip editor
 ```
+
+## Build mutex
+
+If several agents/shells build on the same machine at once, two simultaneous builds
+(or full test runs) can exhaust RAM. `rw conan`, `rw make`, and `rw tidy` automatically
+serialise against each other across all worktrees via a shared `flock` — nothing to
+configure. Test runs don't go through `rw`, so wrap them manually:
+
+```bash
+rw-lock.sh -- bash -c 'cd .build && ./xrpld -u --unittest=MyTest'
+rw-lock.sh --status               # show whether the lock is held, and by what
+```
+
+`RW_LOCK_FILE` overrides the lock file path (default `~/.cache/rippled-build.lock`).
 
 ## Directory layout
 

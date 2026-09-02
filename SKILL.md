@@ -102,7 +102,12 @@ Prompts to also delete the branch.
 
 ### `rw sync` — Copy local configs to all worktrees
 
-### `rw sweep` — Remove worktrees whose remote branch was deleted
+### `rw sweep [--builds]` — Remove worktrees whose branch is merged or remote-deleted
+
+Fetches, then offers to remove worktrees/branches merged into `origin/develop` or whose
+remote branch was deleted (prompts again per-branch if it has uncommitted changes or
+unpushed commits). `--builds` also finds and offers to delete `.build/` directories
+untouched for 7+ days across all worktrees.
 
 ### `rw prune` — Prune stale worktree metadata
 
@@ -115,6 +120,18 @@ The cmake configure step uses these flags (NixOS-specific):
 - `ccache` — compiler caching (via CMAKE_CXX_COMPILER_LAUNCHER)
 - Ninja generator
 - `xrpld=ON`, `tests=ON`, `CMAKE_EXPORT_COMPILE_COMMANDS=ON`
+
+## Build Mutex
+
+`rw conan`, `rw make`, and `rw tidy` automatically serialise against each other across
+all worktrees via a shared `flock` (`~/.cache/rippled-build.lock` by default, override
+with `RW_LOCK_FILE`), so two concurrent agents on the same machine never build at once.
+Test runs don't go through `rw` and aren't covered — wrap them explicitly:
+
+```bash
+rw-lock.sh -- bash -c 'cd .build && ./xrpld -u --unittest=MyTest'
+rw-lock.sh --status               # who holds the lock, since when
+```
 
 ## Directory Layout
 
